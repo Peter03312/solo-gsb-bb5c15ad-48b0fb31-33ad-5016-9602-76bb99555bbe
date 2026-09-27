@@ -839,7 +839,13 @@ def merge_namespace(source: str, payload: MergeRequest, conn=Depends(get_db)) ->
     response_model=AnalysisResult,
 )
 def check_name(namespace: str, payload: NameRequest, conn=Depends(get_db)) -> dict:
-    """只分析不落库：返回规范名、脚本分析与潜在冲突（含未过期预占与释放冷却）。"""
+    """只分析不落库：返回规范名、脚本分析与潜在冲突（含未过期预占与释放冷却）。
+
+    生效脚本策略、已注册名称、有效预占与释放冷却在同一个 SQLite 只读事务
+    快照中读取，过期判定统一使用本次分析捕获的同一时刻：并发释放或策略
+    修改后，响应只反映一个完整状态（不会同时出现 registered 与 released
+    两条指向同一名称的冲突）；只读路径不做惰性清理。
+    """
     return service.analyze_name(conn, namespace, payload.name)
 
 

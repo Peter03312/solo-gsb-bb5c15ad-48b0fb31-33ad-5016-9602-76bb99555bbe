@@ -5414,3 +5414,105 @@ def test_commit_failure_rolls_back_business_rows_and_audit_events(client):
     # 审计事件与业务写入同生共死：没有孤儿 insert 事件
     events = client.get("/name-events").json()["events"]
     assert events == []
+
+
+# ---------- check 只读分析的快照固定 ----------
+#
+# 旧实现的 check（analyze_name / find_conflicts）在自动提交模式下逐条执行
+# SELECT：读完 display_names 之后、读 name_cooldowns 之前，另一连接释放该
+# 名称（同事务删 display_names + 写 name_cooldowns），本次 check 会同时
+# 返回 registered 与 released 两条指向同一名称的冲突。修复后单次分析的
+# 脚本策略、已注册名称、有效预占与释放冷却来自同一份 SQLite 读快照，
+# 过期判定统一使用本次分析捕获的同一时刻，响应只反映一个完整状态。
+
+
+def test_check_fix_snapshot_in_single_read_transaction_wal(client, monkeypatch):
+    """WAL 下 check 的读快照固定：读完已注册名称后另一连接释放该名称，
+    本次响应只反映释放前的完整状态（registered 一条），不混出 released。"""
+    assert register(client, "app").status_code == 201
+    conn = database.get_connection()
+    try:
+        conn.execute("PRAGMA journal_mode = WAL")
+    finally:
+        conn.close()
+
+    real_cooldown_rows = service._active_cooldown_rows
+    injected = {"done": False}
+
+    def racing_cooldown_rows(read_conn, namespace, now=None):
+        # 读事务已开始且已读完 display_names / name_reservations：另一连接
+        # 释放该名称（删 display_names + 写 name_cooldowns，同一事务提交）。
+        # 仅在第一次调用时注入，第二次请求应直接读到释放后的完整状态。
+        if not injected["done"]:
+            injected["done"] = True
+            other = database.get_connection()
+            try:
+                row = other.execute(
+                    "SELECT id, revision FROM display_names WHERE namespace = 'chat'"
+                ).fetchone()
+                service.release_name(other, "chat", row["id"], row["revision"], 3600)
+            finally:
+                other.close()
+        return real_cooldown_rows(read_conn, namespace, now)
+
+    monkeypatch.setattr(service, "_active_cooldown_rows", racing_cooldown_rows)
+
+    body = client.post("/namespaces/chat/check", json={"name": "APP"}).json()
+    # 快照固定：只反映释放前的完整状态——恰好一条 registered 冲突，
+    # 绝不会同时出现 released（旧实现的混读结果）
+    assert [c["source"] for c in body["conflicts"]] == ["registered"]
+    assert body["conflicts"][0]["reason"] == "normalized_match"
+
+    # 无注入再次 check：反映释放后的完整状态——恰好一条 released 冲突
+    body = client.post("/namespaces/chat/check", json={"name": "APP"}).json()
+    assert [c["source"] for c in body["conflicts"]] == ["released"]
+
+
+def test_find_conflicts_reuses_caller_transaction_without_nesting(client):
+    """调用方已持有事务时复用该事务：不嵌套 BEGIN，也不提交 / 回滚调用方事务。"""
+    assert register(client, "app").status_code == 201
+    conn = database.get_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            # 若嵌套 BEGIN，SQLite 会报 "cannot start a transaction within
+            # a transaction"；能正常返回即证明复用了调用方事务
+            conflicts = service.find_conflicts(conn, "chat", "app")
+            assert [c["source"] for c in conflicts] == ["registered"]
+            # 调用方事务仍未被提交或回滚
+            assert conn.in_transaction
+        finally:
+            conn.rollback()
+        assert not conn.in_transaction
+    finally:
+        conn.close()
+
+
+def test_analyze_name_self_opened_read_transaction_always_closed(client, monkeypatch):
+    """自行开启的只读事务在成功与异常后都结束，且不清理过期数据。"""
+    conn = database.get_connection()
+    try:
+        result = service.analyze_name(conn, "chat", "app")
+        assert result["conflicts"] == []
+        # 成功路径：只读事务已结束，连接可复用
+        assert not conn.in_transaction
+    finally:
+        conn.close()
+
+    # 异常路径：分析中途抛错，只读事务同样结束
+    assert register(client, "app").status_code == 201
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("injected")
+
+    monkeypatch.setattr(service, "is_confusable", boom)
+    conn = database.get_connection()
+    try:
+        with pytest.raises(RuntimeError):
+            # "apps" 与库内 "app" 规范名不同，必经 is_confusable 判定
+            service.analyze_name(conn, "chat", "apps")
+        assert not conn.in_transaction
+        # 连接可正常复用，数据原样
+        assert [r["original_name"] for r in service.list_names(conn, "chat")] == ["app"]
+    finally:
+        conn.close()

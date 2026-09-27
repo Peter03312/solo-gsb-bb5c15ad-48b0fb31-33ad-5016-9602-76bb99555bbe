@@ -167,12 +167,23 @@ POST /namespaces/{namespace}/names/allocate）：
 3. COMMIT 本身失败（SQLITE_BUSY 等）仍按原有错误处理：整事务（业务写入
    与审计触发器事件）一起回滚，向上抛出对应的冲突类异常，绝不返回成功，
    也绝不为了补齐响应而在回滚后重复写入
+
+只读分析的快照固定（check 与共享分析路径）：
+1. analyze_name / analyze_batch / find_conflicts 的多次读取（生效脚本
+   策略、已注册名称、有效预占、未过期释放冷却）固定在同一份 SQLite 读
+   快照上，过期判定统一使用本次分析捕获的同一时刻：并发释放或策略修改
+   后，单次分析的响应只反映一个完整状态，不会同时出现 registered 与
+   released 两条指向同一名称的冲突
+2. 调用方已持有事务（如写事务内的复查）时复用该事务：不嵌套 BEGIN，
+   也不提交或回滚调用方事务；否则自行开启只读事务（BEGIN），成功或
+   异常后都以 rollback 结束，且只读路径不做任何惰性清理
 """
 from __future__ import annotations
 
 import json
 import secrets
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
 from confusables import is_confusable
@@ -708,6 +719,26 @@ def purge_expired_cooldowns(
         )
 
 
+@contextmanager
+def _read_snapshot(conn: sqlite3.Connection):
+    """把一连串读取固定到同一份 SQLite 快照上。
+
+    调用方已持有事务（如 BEGIN IMMEDIATE 写事务内的复查）时直接复用该
+    事务：不嵌套 BEGIN，也不提交或回滚调用方的事务。否则自行开启一个
+    只读事务（BEGIN），并在正常结束或异常退出时都以 rollback 收尾
+    （只读事务无需提交，回滚即释放读锁、结束快照）。只读路径不做任何
+    惰性清理，过期数据只在 Python 侧过滤。
+    """
+    if conn.in_transaction:
+        yield
+        return
+    conn.execute("BEGIN")
+    try:
+        yield
+    finally:
+        conn.rollback()
+
+
 def find_conflicts(
     conn: sqlite3.Connection,
     namespace: str,
@@ -719,85 +750,112 @@ def find_conflicts(
     """与同命名空间内已注册名称、有效预占及未过期冷却逐条做规范名/同形判定。
 
     已注册名称冲突排在前（按 id），有效预占冲突居中（按 id），未过期冷却
-    冲突排在后（按 id）。
+    冲突排在后（按 id）。三类记录来自同一份 SQLite 读快照（见
+    _read_snapshot），过期判定统一使用本次调用捕获的同一时刻（now 可显式
+    指定）：并发释放或策略修改后，结果只反映一个完整状态，不会同时出现
+    registered 与 released 两条指向同一名称的冲突。
     exclude_reservation_id：确认注册时排除正在确认的那条预占自身。
     exclude_name_id：改名时排除正在改名的那条已注册记录自身（新规范名
     与自身相等不算冲突）；有效预占与冷却不排除，仍全部参与判定。
     """
+    moment = now or utc_now()
     conflicts: list[dict] = []
-    rows = conn.execute(
-        """
-        SELECT id, original_name, normalized_name
-        FROM display_names
-        WHERE namespace = ?
-        ORDER BY id
-        """,
-        (namespace,),
-    ).fetchall()
-    for row in rows:
-        if exclude_name_id is not None and row["id"] == exclude_name_id:
-            continue
-        existing_normalized = row["normalized_name"]
-        if existing_normalized == normalized_name:
-            reason = REASON_NORMALIZED_MATCH
-        elif is_confusable(normalized_name, existing_normalized):
-            reason = REASON_CONFUSABLE
-        else:
-            continue
-        conflicts.append(_conflict_entry(row, SOURCE_REGISTERED, reason))
+    with _read_snapshot(conn):
+        rows = conn.execute(
+            """
+            SELECT id, original_name, normalized_name
+            FROM display_names
+            WHERE namespace = ?
+            ORDER BY id
+            """,
+            (namespace,),
+        ).fetchall()
+        for row in rows:
+            if exclude_name_id is not None and row["id"] == exclude_name_id:
+                continue
+            existing_normalized = row["normalized_name"]
+            if existing_normalized == normalized_name:
+                reason = REASON_NORMALIZED_MATCH
+            elif is_confusable(normalized_name, existing_normalized):
+                reason = REASON_CONFUSABLE
+            else:
+                continue
+            conflicts.append(_conflict_entry(row, SOURCE_REGISTERED, reason))
 
-    for row in _active_reservation_rows(conn, namespace, now):
-        if exclude_reservation_id is not None and row["id"] == exclude_reservation_id:
-            continue
-        existing_normalized = row["normalized_name"]
-        if existing_normalized == normalized_name:
-            reason = REASON_NORMALIZED_MATCH
-        elif is_confusable(normalized_name, existing_normalized):
-            reason = REASON_CONFUSABLE
-        else:
-            continue
-        conflicts.append(_conflict_entry(row, SOURCE_RESERVATION, reason))
+        for row in _active_reservation_rows(conn, namespace, moment):
+            if exclude_reservation_id is not None and row["id"] == exclude_reservation_id:
+                continue
+            existing_normalized = row["normalized_name"]
+            if existing_normalized == normalized_name:
+                reason = REASON_NORMALIZED_MATCH
+            elif is_confusable(normalized_name, existing_normalized):
+                reason = REASON_CONFUSABLE
+            else:
+                continue
+            conflicts.append(_conflict_entry(row, SOURCE_RESERVATION, reason))
 
-    for row in _active_cooldown_rows(conn, namespace, now):
-        existing_normalized = row["normalized_name"]
-        if existing_normalized == normalized_name:
-            reason = REASON_NORMALIZED_MATCH
-        elif is_confusable(normalized_name, existing_normalized):
-            reason = REASON_CONFUSABLE
-        else:
-            continue
-        conflicts.append(_conflict_entry(row, SOURCE_RELEASED, reason))
+        for row in _active_cooldown_rows(conn, namespace, moment):
+            existing_normalized = row["normalized_name"]
+            if existing_normalized == normalized_name:
+                reason = REASON_NORMALIZED_MATCH
+            elif is_confusable(normalized_name, existing_normalized):
+                reason = REASON_CONFUSABLE
+            else:
+                continue
+            conflicts.append(_conflict_entry(row, SOURCE_RELEASED, reason))
     return conflicts
 
 
-def analyze_name(conn: sqlite3.Connection, namespace: str, name: str) -> dict:
+def analyze_name(
+    conn: sqlite3.Connection, namespace: str, name: str, now: datetime | None = None
+) -> dict:
     """完整分析：规范名 + 脚本分析 + 冲突检测（只读，不落库）。
 
-    冲突同时覆盖已注册名称、未过期预占与未过期释放冷却；过期记录不参与，
-    也不会在此被删除（只读路径不做惰性清理）。混脚本按所属命名空间的
-    生效策略判定（未配置时使用内建默认策略）。
+    生效脚本策略、已注册名称、未过期预占与未过期释放冷却全部来自同一份
+    SQLite 读快照（见 _read_snapshot；调用方已持有事务时复用该事务），
+    过期判定统一使用本次分析捕获的同一时刻：并发释放或策略修改后，响应
+    只反映一个完整状态，不会同时出现 registered 与 released 两条指向
+    同一名称的冲突。只读路径不做惰性清理，过期记录不参与判定，也不会在
+    此被删除。混脚本按所属命名空间的生效策略判定（未配置时使用内建默认
+    策略）。
     """
     normalized = normalize_name(name)
-    pairs = get_blocked_pairs(conn, namespace)
+    moment = now or utc_now()
+    with _read_snapshot(conn):
+        pairs = get_blocked_pairs(conn, namespace)
+        conflicts = find_conflicts(conn, namespace, normalized, now=moment)
     return {
         "namespace": namespace,
         "original_name": name,
         "normalized_name": normalized,
         **analyze_scripts(name, pairs),
-        "conflicts": find_conflicts(conn, namespace, normalized),
+        "conflicts": conflicts,
     }
 
 
-def analyze_batch(conn: sqlite3.Connection, namespace: str, names: list[str]) -> list[dict]:
+def analyze_batch(
+    conn: sqlite3.Connection,
+    namespace: str,
+    names: list[str],
+    now: datetime | None = None,
+) -> list[dict]:
     """整批联合分析：逐项复用单条分析，再对批内两两做规范名 / 同形判定。
 
     返回与请求顺序一致的分析结果列表；批内冲突按原请求索引互相标注在
     双方的 batch_conflicts 中（字段与库内冲突记录一致，只是以索引定位）。
+    整批的单条分析共享同一份 SQLite 读快照与同一到期判定时刻（见
+    _read_snapshot），批内两两判定为纯内存计算。
     """
-    analyses = [
-        {"index": index, **analyze_name(conn, namespace, name), "batch_conflicts": []}
-        for index, name in enumerate(names)
-    ]
+    moment = now or utc_now()
+    with _read_snapshot(conn):
+        analyses = [
+            {
+                "index": index,
+                **analyze_name(conn, namespace, name, now=moment),
+                "batch_conflicts": [],
+            }
+            for index, name in enumerate(names)
+        ]
     for left in range(len(analyses)):
         for right in range(left + 1, len(analyses)):
             a, b = analyses[left], analyses[right]

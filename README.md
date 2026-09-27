@@ -109,7 +109,7 @@ uvicorn app.main:app --reload --port 8000
 | `POST` | `/namespaces/{source}/merge` | **合并命名空间**：`{"target_namespace": ...}`，写锁事务内复查源与目标两侧的已注册名称、有效预占与释放冷却，并以**目标空间策略**检查两侧混脚本 → 有冲突或违规 `409`（`conflicts` 附双方记录、`script_violations` 附逐条明细，不改数据）；无冲突且两侧合规则同事务迁移并返回迁移数量 → `200`；目标与源相同 → `422` |
 | `PUT` | `/namespaces/{namespace}/script-policy` | **配置混脚本策略**：`{"blocked_script_pairs": [["Latin","Cyrillic"], ...], "expected_revision": ...}`（脚本对无序、自动去重，空列表表示全部放行；未配置时当前版本为 0），单个写锁事务内校验版本并扫描该空间已注册名称、有效预占与释放冷却 → 成功 `200`（首次 `revision=1`，之后递增）；版本过期 → `409 stale_revision`（附 `current_revision`）；新策略会使现存名称违规 → `409 script_policy_conflict`（附逐条违规明细，不更新）；脚本名未知 / 同名对 / 项长度不为 2 / 超过 500 对 → `422` |
 | `GET` | `/namespaces/{namespace}/script-policy` | 读取已配置的混脚本策略 → `200`；命名空间尚未配置 → `404`（写入与 `check` 此时仍按内建默认策略判定） |
-| `POST` | `/namespaces/{namespace}/check` | **只分析不落库**：返回规范名、脚本分析、码点、生效策略（`blocked_script_pairs`）、命中的脚本对（`violating_script_pairs`）与潜在冲突（含有效预占与释放冷却） |
+| `POST` | `/namespaces/{namespace}/check` | **只分析不落库**：返回规范名、脚本分析、码点、生效策略（`blocked_script_pairs`）、命中的脚本对（`violating_script_pairs`）与潜在冲突（含有效预占与释放冷却）；策略、已注册名称、有效预占与冷却在**同一个 SQLite 只读事务快照**中读取并以同一时刻判定到期，并发释放 / 策略修改后响应只反映一个完整状态 |
 | `POST` | `/name-risk-clusters` | **跨空间同形风险簇**：`{"namespaces": ["a","b", ...], "max_names": ≤500}`（2–20 个互不相同的命名空间），单个 SQLite 读事务固定各空间已注册名称 / 有效预占 / 未过期冷却快照，只对跨空间节点按规范名相同或同形建边，按连通分量返回至少含 2 个节点的簇（A-B、B-C 即使 A-C 不冲突也同簇）→ `200`；快照总量超过 `max_names` → `413`（不截断计算）；命名空间数量 / 重复 / `max_names` 越界 → `422` |
 | `POST` | `/namespaces/{namespace}/snapshot-proof` | **快照 Merkle 包含证明**：`{"nodes": [{"kind": "registered"|"reservation"|"released", "id": ...}, ...], "max_nodes": ≤500}`（1–20 个互不相同的 kind/id），单个 SQLite 读事务固定生效脚本策略 + 已注册名称 + 有效预占 + 未过期冷却，按（类型序, id）排序后以规范 JSON + SHA-256 建树（叶 `0x00`、父 `0x01`、奇数层复制末节点）→ `200` 返回 `root` / `leaf_count` 与各节点带左右方向的包含证明（与请求顺序无关）；节点不在快照中 → `404`；业务快照超过 `max_nodes` → `413`（不截断、不建树）；nodes 数量 / 重复 / `max_nodes` 越界 → `422` |
 | `GET` | `/namespaces/{namespace}/names` | 列出命名空间内已注册名称（预占未确认前不出现在此） |
@@ -295,6 +295,12 @@ curl -X POST http://localhost:8000/namespaces/chat/check \
 # 200 {"normalized_name":"арр","mixed_script_violation":false,
 #      "scripts":["Cyrillic"],"conflicts":[{"reason":"confusable",...}], ...}
 ```
+
+`check`（及注册 / 批量 / 预占前置的共享只读分析）把生效脚本策略、已注册
+名称、有效预占与未过期释放冷却固定在**同一个 SQLite 只读事务快照**中读取，
+过期判定统一使用本次分析捕获的同一时刻：即使分析期间另一请求并发释放该
+名称或修改策略，响应也只反映一个完整状态——不会同时出现 `registered` 与
+`released` 两条指向同一名称的冲突；只读路径不做惰性清理。
 
 批量注册：全部通过 → `201`，`items` 按原请求顺序返回并带 `index`：
 
@@ -755,6 +761,17 @@ curl 'http://localhost:8000/name-events?namespace=chat&after_id=2&limit=2'
 该保证由测试中“双连接确定性交错”用例覆盖：用第三个连接的只读事务持有共享锁
 挡住主连接的 `COMMIT`，确认其阻塞后再放行，并在提交完成、调用方恢复执行的
 同一窗口内由第二连接执行改名 / 释放 / 合并。
+
+## 只读分析的快照保证（check）
+
+`POST /namespaces/{namespace}/check`（及注册 / 批量 / 预占前置的共享只读
+分析）把单次分析所需的**生效脚本策略、已注册名称、有效预占与未过期释放冷却**
+固定在**同一份 SQLite 读快照**上：连接未持有事务时自行开启只读事务
+（`BEGIN`），成功或异常后都以 `ROLLBACK` 结束，且不做任何惰性清理；在写事务
+内复查时则直接复用调用方事务（不嵌套 `BEGIN`，也不提交或回滚调用方事务）。
+过期判定统一使用本次分析捕获的同一时刻。因此并发释放或策略修改后，单次分析
+的响应只反映一个完整状态——不会同时返回 `registered` 与 `released` 两条指向
+同一名称的冲突。
 
 ## 判定规则说明
 
