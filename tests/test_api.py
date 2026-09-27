@@ -2510,6 +2510,198 @@ def test_check_reports_active_cooldown_conflict(client):
     assert len(list_cooldowns(client).json()) == 1
 
 
+# ---------- check 只读分析的单快照一致性 ----------
+
+
+def test_check_fix_snapshot_in_single_read_transaction_wal(client, monkeypatch):
+    """check 单读事务快照：读已注册名称后另一连接释放该名称，响应只反映一个完整状态。
+
+    已注册名称先读；在冷却记录读取前，另一连接提交“释放该名称”（同事务删除
+    已注册行 + 写入冷却记录）。单一 BEGIN 读事务保证该提交对本次分析不可见：
+    响应只含 registered 一条冲突，不会同时出现 registered 与 released 两条
+    冲突。不带注入再次检查时只看到 released 一条——两次响应各自完整。
+    """
+    created = register(client, "app").json()
+    conn = database.get_connection()
+    try:
+        conn.execute("PRAGMA journal_mode = WAL")
+    finally:
+        conn.close()
+
+    real_cooldown_rows = service._active_cooldown_rows
+    injected = {"done": False}
+
+    def racing_cooldown_rows(read_conn, namespace, now=None):
+        # 读事务已开始且已读完 display_names 与预占：另一连接释放该名称
+        # （仅在第一次调用时注入，第二次请求应直接读到释放后的完整状态）
+        if not injected["done"]:
+            injected["done"] = True
+            other = database.get_connection()
+            try:
+                service.release_name(other, "chat", created["id"], 1, 3600)
+            finally:
+                other.close()
+        return real_cooldown_rows(read_conn, namespace, now)
+
+    monkeypatch.setattr(service, "_active_cooldown_rows", racing_cooldown_rows)
+
+    resp = client.post("/namespaces/chat/check", json={"name": "app"})
+    assert resp.status_code == 200
+    conflicts = resp.json()["conflicts"]
+    # 快照在释放提交前建立：只看到 registered，不会混读 released
+    assert [(c["source"], c["reason"]) for c in conflicts] == [
+        ("registered", "normalized_match")
+    ]
+
+    # 不带注入再次检查：释放已提交，只看到 released（响应同样只反映一个完整状态）
+    resp = client.post("/namespaces/chat/check", json={"name": "app"})
+    assert resp.status_code == 200
+    conflicts = resp.json()["conflicts"]
+    assert [(c["source"], c["reason"]) for c in conflicts] == [
+        ("released", "normalized_match")
+    ]
+
+
+def test_check_snapshot_covers_policy_and_names_wal(client, monkeypatch):
+    """check 单读事务快照同时覆盖脚本策略与名称数据。
+
+    策略读取后、冲突读取前，另一连接提交“PUT 新策略 + 按新策略注册名称”。
+    单一读事务保证本次分析只反映提交前的完整状态：旧策略判定（默认策略下
+    Latin+Cyrillic 混脚本违规）且看不到新注册的名称；再次检查才反映新状态。
+    """
+    conn = database.get_connection()
+    try:
+        conn.execute("PRAGMA journal_mode = WAL")
+    finally:
+        conn.close()
+
+    real_find_conflicts = service.find_conflicts
+    injected = {"done": False}
+
+    def racing_find_conflicts(read_conn, namespace, normalized_name, **kwargs):
+        # 策略已读、冲突未读：另一连接 PUT 放行 Latin+Cyrillic 的策略并注册 MIXED_ADMIN
+        if not injected["done"]:
+            injected["done"] = True
+            other = database.get_connection()
+            try:
+                service.put_script_policy(other, "chat", [("Han", "Latin")], 0)
+                service.register_name(
+                    other, "chat", MIXED_ADMIN, normalize_name(MIXED_ADMIN)
+                )
+            finally:
+                other.close()
+        return real_find_conflicts(read_conn, namespace, normalized_name, **kwargs)
+
+    monkeypatch.setattr(service, "find_conflicts", racing_find_conflicts)
+
+    resp = client.post("/namespaces/chat/check", json={"name": MIXED_ADMIN})
+    assert resp.status_code == 200
+    body = resp.json()
+    # 快照在并发提交前建立：旧（默认）策略判定违规，且看不到新注册的名称
+    assert body["blocked_script_pairs"] == DEFAULT_PAIRS
+    assert body["mixed_script_violation"] is True
+    assert body["conflicts"] == []
+
+    # 不带注入再次检查：新策略放行，且能看到已注册的同名记录
+    resp = client.post("/namespaces/chat/check", json={"name": MIXED_ADMIN})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["blocked_script_pairs"] == [["Han", "Latin"]]
+    assert body["mixed_script_violation"] is False
+    assert [(c["source"], c["reason"]) for c in body["conflicts"]] == [
+        ("registered", "normalized_match")
+    ]
+
+
+def test_check_uses_single_captured_time_for_expiry(client, monkeypatch):
+    """单次分析的过期判定统一使用同一时刻：预占与冷却读取收到同一个 now。"""
+    seen = {}
+    real_reservation_rows = service._active_reservation_rows
+    real_cooldown_rows = service._active_cooldown_rows
+
+    def spy_reservation_rows(conn, namespace, now=None):
+        seen["reservation_now"] = now
+        return real_reservation_rows(conn, namespace, now)
+
+    def spy_cooldown_rows(conn, namespace, now=None):
+        seen["cooldown_now"] = now
+        return real_cooldown_rows(conn, namespace, now)
+
+    monkeypatch.setattr(service, "_active_reservation_rows", spy_reservation_rows)
+    monkeypatch.setattr(service, "_active_cooldown_rows", spy_cooldown_rows)
+
+    resp = client.post("/namespaces/chat/check", json={"name": "app"})
+    assert resp.status_code == 200
+    # 由本次分析捕获一次并同时传给两类记录，而不是各自再取当前时间
+    assert seen["reservation_now"] is not None
+    assert seen["reservation_now"] == seen["cooldown_now"]
+
+
+def test_find_conflicts_reuses_existing_write_transaction(client):
+    """find_conflicts / analyze_name 在已有写事务内复用该事务。
+
+    不嵌套 BEGIN，也不提交或回滚调用方事务：事务内判定结果与库中一致，
+    调用方事务在调用后仍处于打开状态，可继续写入并自行提交。
+    """
+    assert register(client, "app").status_code == 201
+    conn = database.get_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conflicts = service.find_conflicts(conn, "chat", "app")
+        assert [(c["source"], c["reason"]) for c in conflicts] == [
+            ("registered", "normalized_match")
+        ]
+        analysis = service.analyze_name(conn, "chat", "app")
+        assert [c["source"] for c in analysis["conflicts"]] == ["registered"]
+        # 调用方事务未被提交或回滚，仍可继续写入并自行提交
+        assert conn.in_transaction
+        conn.execute(
+            """
+            INSERT INTO display_names (namespace, original_name, normalized_name)
+            VALUES ('chat', 'other', 'other')
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    names = client.get("/namespaces/chat/names").json()
+    assert [n["original_name"] for n in names] == ["app", "other"]
+
+
+def test_analyze_name_standalone_read_transaction_is_closed(client):
+    """不在事务中时自行开启只读事务，成功后结束：连接不残留事务、可立即复用。"""
+    assert register(client, "app").status_code == 201
+    conn = database.get_connection()
+    try:
+        analysis = service.analyze_name(conn, "chat", "app")
+        assert [c["source"] for c in analysis["conflicts"]] == ["registered"]
+        assert not conn.in_transaction
+        # 连接可立即开启写事务（只读事务已在成功路径结束）
+        conn.execute("BEGIN IMMEDIATE")
+        conn.rollback()
+    finally:
+        conn.close()
+
+
+def test_analyze_name_read_transaction_is_closed_on_error(client, monkeypatch):
+    """只读事务在异常路径同样结束：连接不残留事务、可正常复用，数据不变。"""
+    assert register(client, "app").status_code == 201
+
+    def boom(conn, namespace, now=None):
+        raise RuntimeError("injected read failure")
+
+    monkeypatch.setattr(service, "_active_reservation_rows", boom)
+    conn = database.get_connection()
+    try:
+        with pytest.raises(RuntimeError, match="injected read failure"):
+            service.analyze_name(conn, "chat", "app")
+        assert not conn.in_transaction
+        # 连接可复用，数据原样（只读路径不清理、不写入）
+        assert [n["original_name"] for n in service.list_names(conn, "chat")] == ["app"]
+    finally:
+        conn.close()
+
+
 def test_cooldowns_are_namespace_isolated(client):
     created = register(client, "app", namespace="a").json()
     release(client, created["id"], 1, namespace="a")

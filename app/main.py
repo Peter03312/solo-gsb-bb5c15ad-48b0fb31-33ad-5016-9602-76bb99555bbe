@@ -13,7 +13,7 @@
 - POST   /namespaces/{source}/merge                                 合并命名空间（200 / 409 / 422，单事务）
 - PUT    /namespaces/{namespace}/script-policy                      配置命名空间混脚本策略（200 / 409 / 422，单事务）
 - GET    /namespaces/{namespace}/script-policy                      读取命名空间混脚本策略（200 / 404）
-- POST   /namespaces/{namespace}/check                              只分析不落库（200）
+- POST   /namespaces/{namespace}/check                              只分析不落库（200，单一读事务快照）
 - GET    /namespaces/{namespace}/names                              列出命名空间内已注册名称
 - POST   /name-risk-clusters                                        跨空间同形风险簇（200 / 413 / 422，单一读事务快照）
 - POST   /namespaces/{namespace}/snapshot-proof                     快照 Merkle 包含证明（200 / 404 / 413 / 422，单一读事务快照）
@@ -839,7 +839,13 @@ def merge_namespace(source: str, payload: MergeRequest, conn=Depends(get_db)) ->
     response_model=AnalysisResult,
 )
 def check_name(namespace: str, payload: NameRequest, conn=Depends(get_db)) -> dict:
-    """只分析不落库：返回规范名、脚本分析与潜在冲突（含未过期预占与释放冷却）。"""
+    """只分析不落库：返回规范名、脚本分析与潜在冲突（含未过期预占与释放冷却）。
+
+    单次分析的生效脚本策略、已注册名称、有效预占与释放冷却在同一个
+    SQLite 读事务快照中读取，过期判定使用同一时刻：并发释放或策略修改
+    在分析中途提交时，响应只反映一个完整状态，不会同时出现同一名称的
+    registered 与 released 两条冲突。
+    """
     return service.analyze_name(conn, namespace, payload.name)
 
 

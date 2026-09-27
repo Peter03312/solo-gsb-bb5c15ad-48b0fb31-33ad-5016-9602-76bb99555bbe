@@ -152,6 +152,17 @@ POST /namespaces/{namespace}/names/allocate）：
    迁出 / 迁入两侧都可见）；多取一条探测是否还有后续，据此给出
    next_cursor（本页最后一条事件号）或 None
 
+只读分析快照（analyze_name / find_conflicts，POST .../check 等）：
+1. 单次分析的生效脚本策略、已注册名称、未消费预占与释放冷却全部在同一个
+   SQLite 读事务（BEGIN）中读取，共享同一份数据库快照：读取已注册名称后
+   另一连接才提交的释放 / 策略修改对本次分析不可见，响应只反映一个完整
+   状态——不会同时返回同一名称的 registered 与 released 两条冲突
+2. 过期判定统一使用本次分析捕获的同一时刻（预占与冷却共用一个 now）；
+   只读路径不做任何惰性清理，过期 / 已消费记录在 Python 侧过滤
+3. 共享分析与冲突查询在已有（写）事务内被调用时直接复用该事务，不嵌套
+   BEGIN，也不提交或回滚调用方事务；不在事务中时自行开启只读事务，并在
+   成功或异常后都以 rollback 结束（见 _read_snapshot）
+
 写事务成功响应的快照固定（全部写入口一致）：
 1. 单条注册、批量注册、预占（create_reservation）、预占确认（claim）、
    改名、交换、释放、命名空间合并、策略 PUT 与候选分配的成功响应数据一律
@@ -173,6 +184,8 @@ from __future__ import annotations
 import json
 import secrets
 import sqlite3
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
 from confusables import is_confusable
@@ -388,6 +401,28 @@ def utc_now_iso() -> str:
 def parse_expires_at(value: str) -> datetime:
     """解析 expires_at（Z 结尾的 UTC ISO 8601）为 naive datetime。"""
     return datetime.fromisoformat(value.removesuffix("Z")).replace(tzinfo=None)
+
+
+@contextmanager
+def _read_snapshot(conn: sqlite3.Connection) -> Iterator[None]:
+    """在单个 SQLite 读快照中执行只读查询。
+
+    - 连接已在事务中（如调用方的 BEGIN IMMEDIATE 写事务）：直接复用该事务，
+      不嵌套 BEGIN，也不提交或回滚调用方的事务；
+    - 连接不在事务中：自行开启一个只读事务（BEGIN），并在成功或异常后都以
+      rollback 结束——只读路径不做任何惰性清理，回滚即结束，无副作用。
+
+    同一快照内的多条 SELECT 看到一致的数据库状态：快照建立后其他连接的
+    提交（如并发释放名称、修改脚本策略）对本次读取不可见。
+    """
+    if conn.in_transaction:
+        yield
+        return
+    conn.execute("BEGIN")
+    try:
+        yield
+    finally:
+        conn.rollback()
 
 
 # ---------- 命名空间混脚本策略 ----------
@@ -723,50 +758,58 @@ def find_conflicts(
     exclude_reservation_id：确认注册时排除正在确认的那条预占自身。
     exclude_name_id：改名时排除正在改名的那条已注册记录自身（新规范名
     与自身相等不算冲突）；有效预占与冷却不排除，仍全部参与判定。
+
+    三类数据在同一个 SQLite 读快照中读取（见 _read_snapshot）：已有（写）
+    事务内被调用时复用该事务，否则自行开启只读事务并在结束后关闭；并发
+    释放在读取已注册名称后提交也不会让本次查询同时看到 registered 与
+    released 两条冲突。预占与冷却的过期判定统一使用同一个时刻（now 未
+    提供时在本次查询开始处捕获一次）。
     """
+    moment = now or utc_now()
     conflicts: list[dict] = []
-    rows = conn.execute(
-        """
-        SELECT id, original_name, normalized_name
-        FROM display_names
-        WHERE namespace = ?
-        ORDER BY id
-        """,
-        (namespace,),
-    ).fetchall()
-    for row in rows:
-        if exclude_name_id is not None and row["id"] == exclude_name_id:
-            continue
-        existing_normalized = row["normalized_name"]
-        if existing_normalized == normalized_name:
-            reason = REASON_NORMALIZED_MATCH
-        elif is_confusable(normalized_name, existing_normalized):
-            reason = REASON_CONFUSABLE
-        else:
-            continue
-        conflicts.append(_conflict_entry(row, SOURCE_REGISTERED, reason))
+    with _read_snapshot(conn):
+        rows = conn.execute(
+            """
+            SELECT id, original_name, normalized_name
+            FROM display_names
+            WHERE namespace = ?
+            ORDER BY id
+            """,
+            (namespace,),
+        ).fetchall()
+        for row in rows:
+            if exclude_name_id is not None and row["id"] == exclude_name_id:
+                continue
+            existing_normalized = row["normalized_name"]
+            if existing_normalized == normalized_name:
+                reason = REASON_NORMALIZED_MATCH
+            elif is_confusable(normalized_name, existing_normalized):
+                reason = REASON_CONFUSABLE
+            else:
+                continue
+            conflicts.append(_conflict_entry(row, SOURCE_REGISTERED, reason))
 
-    for row in _active_reservation_rows(conn, namespace, now):
-        if exclude_reservation_id is not None and row["id"] == exclude_reservation_id:
-            continue
-        existing_normalized = row["normalized_name"]
-        if existing_normalized == normalized_name:
-            reason = REASON_NORMALIZED_MATCH
-        elif is_confusable(normalized_name, existing_normalized):
-            reason = REASON_CONFUSABLE
-        else:
-            continue
-        conflicts.append(_conflict_entry(row, SOURCE_RESERVATION, reason))
+        for row in _active_reservation_rows(conn, namespace, moment):
+            if exclude_reservation_id is not None and row["id"] == exclude_reservation_id:
+                continue
+            existing_normalized = row["normalized_name"]
+            if existing_normalized == normalized_name:
+                reason = REASON_NORMALIZED_MATCH
+            elif is_confusable(normalized_name, existing_normalized):
+                reason = REASON_CONFUSABLE
+            else:
+                continue
+            conflicts.append(_conflict_entry(row, SOURCE_RESERVATION, reason))
 
-    for row in _active_cooldown_rows(conn, namespace, now):
-        existing_normalized = row["normalized_name"]
-        if existing_normalized == normalized_name:
-            reason = REASON_NORMALIZED_MATCH
-        elif is_confusable(normalized_name, existing_normalized):
-            reason = REASON_CONFUSABLE
-        else:
-            continue
-        conflicts.append(_conflict_entry(row, SOURCE_RELEASED, reason))
+        for row in _active_cooldown_rows(conn, namespace, moment):
+            existing_normalized = row["normalized_name"]
+            if existing_normalized == normalized_name:
+                reason = REASON_NORMALIZED_MATCH
+            elif is_confusable(normalized_name, existing_normalized):
+                reason = REASON_CONFUSABLE
+            else:
+                continue
+            conflicts.append(_conflict_entry(row, SOURCE_RELEASED, reason))
     return conflicts
 
 
@@ -776,16 +819,22 @@ def analyze_name(conn: sqlite3.Connection, namespace: str, name: str) -> dict:
     冲突同时覆盖已注册名称、未过期预占与未过期释放冷却；过期记录不参与，
     也不会在此被删除（只读路径不做惰性清理）。混脚本按所属命名空间的
     生效策略判定（未配置时使用内建默认策略）。
+
+    生效脚本策略与三类冲突数据在同一个 SQLite 读快照中读取（见
+    _read_snapshot），过期判定统一使用本次分析捕获的同一时刻：并发释放
+    或策略修改在分析中途提交时，响应只反映一个完整状态。
     """
     normalized = normalize_name(name)
-    pairs = get_blocked_pairs(conn, namespace)
-    return {
-        "namespace": namespace,
-        "original_name": name,
-        "normalized_name": normalized,
-        **analyze_scripts(name, pairs),
-        "conflicts": find_conflicts(conn, namespace, normalized),
-    }
+    with _read_snapshot(conn):
+        moment = utc_now()
+        pairs = get_blocked_pairs(conn, namespace)
+        return {
+            "namespace": namespace,
+            "original_name": name,
+            "normalized_name": normalized,
+            **analyze_scripts(name, pairs),
+            "conflicts": find_conflicts(conn, namespace, normalized, now=moment),
+        }
 
 
 def analyze_batch(conn: sqlite3.Connection, namespace: str, names: list[str]) -> list[dict]:
@@ -1813,8 +1862,7 @@ def find_name_risk_clusters(
     ordered_namespaces = tuple(sorted(set(namespaces)))
 
     # 单一读事务固定全部快照：事务期间其他连接的提交对本连接不可见
-    conn.execute("BEGIN")
-    try:
+    with _read_snapshot(conn):
         registered = _registered_snapshot_rows(conn, ordered_namespaces)
         reservations = _reservation_snapshot_rows(conn, ordered_namespaces, moment)
         cooldowns = _cooldown_snapshot_rows(conn, ordered_namespaces, moment)
@@ -1873,8 +1921,6 @@ def find_name_risk_clusters(
                 for right in by_normalized[right_norm]:
                     if nodes[left]["namespace"] != nodes[right]["namespace"]:
                         link(left, right, REASON_CONFUSABLE)
-    finally:
-        conn.rollback()
 
     # 3. 连通分量：只保留至少 2 个节点的分量（无跨空间边的孤立节点丢弃）
     members: dict[int, list[int]] = {}
@@ -2110,14 +2156,11 @@ def build_snapshot_proof(
     moment = now or utc_now()
 
     # 单一读事务固定全部快照：事务期间其他连接的提交对本连接不可见
-    conn.execute("BEGIN")
-    try:
+    with _read_snapshot(conn):
         registered = _proof_registered_rows(conn, namespace)
         reservations = _proof_reservation_rows(conn, namespace, moment)
         cooldowns = _proof_cooldown_rows(conn, namespace, moment)
         policy_leaf = _effective_policy_leaf(conn, namespace)
-    finally:
-        conn.rollback()
 
     snapshot_count = len(registered) + len(reservations) + len(cooldowns)
     if snapshot_count > max_nodes:
